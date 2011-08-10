@@ -31,7 +31,7 @@
 #include "modbus-rtu.h"
 #include "modbus-rtu-private.h"
 
-#if defined(HAVE_DECL_TIOCSRS485)
+#if HAVE_DECL_TIOCSRS485
 #include <sys/ioctl.h>
 #include <linux/serial.h>
 #endif
@@ -264,6 +264,21 @@ static int win32_ser_read(struct win32_ser *ws, uint8_t *p_msg,
 }
 #endif
 
+void _modbus_rtu_ioctl_rts(int fd, int on)
+{
+#if HAVE_DECL_TIOCM_RTS
+    int flags;
+
+    ioctl(fd, TIOCMGET, &flags);
+    if (on) {
+        flags |= TIOCM_RTS;
+    } else {
+        flags &= ~TIOCM_RTS;
+    }
+    ioctl(fd, TIOCMSET, &flags);
+#endif
+}
+
 ssize_t _modbus_rtu_send(modbus_t *ctx, const uint8_t *req, int req_length)
 {
 #if defined(_WIN32)
@@ -271,7 +286,26 @@ ssize_t _modbus_rtu_send(modbus_t *ctx, const uint8_t *req, int req_length)
     DWORD n_bytes = 0;
     return (WriteFile(ctx_rtu->w_ser.fd, req, req_length, &n_bytes, NULL)) ? n_bytes : -1;
 #else
-    return write(ctx->s, req, req_length);
+    modbus_rtu_t *ctx_rtu = ctx->backend_data;
+    if (ctx_rtu->rts != MODBUS_RTU_RTS_NONE) {
+        ssize_t size;
+
+        if (ctx->debug) {
+            fprintf(stderr, "Sending request using RTS signal\n");
+        }
+
+        _modbus_rtu_ioctl_rts(ctx->s, ctx_rtu->rts == MODBUS_RTU_RTS_UP);
+        usleep(_MODBUS_RTU_TIME_BETWEEN_RTS_SWITCH);
+
+        size = write(ctx->s, req, req_length);
+
+        usleep(_MODBUS_RTU_TIME_BETWEEN_RTS_SWITCH);
+        _modbus_rtu_ioctl_rts(ctx->s, ctx_rtu->rts != MODBUS_RTU_RTS_UP);
+
+        return size;
+    } else {
+        return write(ctx->s, req, req_length);
+    }
 #endif
 }
 
@@ -705,17 +739,24 @@ static int _modbus_rtu_connect(modbus_t *ctx)
     if (tcsetattr(ctx->s, TCSANOW, &tios) < 0) {
         return -1;
     }
+#endif
 
+#if HAVE_DECL_TIOCSRS485
     /* The RS232 mode has been set by default */
     ctx_rtu->serial_mode = MODBUS_RTU_RS232;
+
+    /* The RTS use has been set by default */
+    ctx_rtu->rts = MODBUS_RTU_RTS_NONE;
+
 #endif
+
     return 0;
 }
 
 int modbus_rtu_set_serial_mode(modbus_t *ctx, int mode)
 {
     if (ctx->backend->backend_type == _MODBUS_BACKEND_TYPE_RTU) {
-#if defined(HAVE_DECL_TIOCSRS485)
+#if HAVE_DECL_TIOCSRS485
         modbus_rtu_t *ctx_rtu = ctx->backend_data;
         struct serial_rs485 rs485conf;
         memset(&rs485conf, 0x0, sizeof(struct serial_rs485));
@@ -752,8 +793,48 @@ int modbus_rtu_set_serial_mode(modbus_t *ctx, int mode)
 
 int modbus_rtu_get_serial_mode(modbus_t *ctx) {
     if (ctx->backend->backend_type == _MODBUS_BACKEND_TYPE_RTU) {
+#if HAVE_DECL_TIOCSRS485
         modbus_rtu_t *ctx_rtu = ctx->backend_data;
         return ctx_rtu->serial_mode;
+#else
+        if (ctx->debug) {
+            fprintf(stderr, "This function isn't supported on your platform\n");
+        }
+        errno = ENOTSUP;
+        return -1;
+#endif
+    } else {
+        errno = EINVAL;
+        return -1;
+    }
+}
+
+int modbus_rtu_set_rts(modbus_t *ctx, int mode)
+{
+#if HAVE_DECL_TIOCM_RTS
+    if (ctx->backend->backend_type == _MODBUS_BACKEND_TYPE_RTU) {
+        modbus_rtu_t *ctx_rtu = ctx->backend_data;
+
+        if (mode == MODBUS_RTU_RTS_NONE || mode == MODBUS_RTU_RTS_UP ||
+            mode == MODBUS_RTU_RTS_DOWN) {
+            ctx_rtu->rts = mode;
+
+            /* Set the RTS bit in order to not reserve the RS485 bus */
+            _modbus_rtu_ioctl_rts(ctx->s, ctx_rtu->rts != MODBUS_RTU_RTS_UP);
+
+            return 0;
+        }
+    }
+#endif
+    /* Wrong backend or invalid mode specified */
+    errno = EINVAL;
+    return -1;
+}
+
+int modbus_rtu_get_rts(modbus_t *ctx) {
+    if (ctx->backend->backend_type == _MODBUS_BACKEND_TYPE_RTU) {
+        modbus_rtu_t *ctx_rtu = ctx->backend_data;
+        return ctx_rtu->rts;
     } else {
         errno = EINVAL;
         return -1;
