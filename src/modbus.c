@@ -315,6 +315,7 @@ static int compute_data_length_after_meta(modbus_t *ctx, uint8_t *msg,
 }
 
 
+
 /* Waits a response from a modbus server or a request from a modbus client.
    This function blocks if there is no replies (3 timeouts).
 
@@ -328,11 +329,11 @@ static int compute_data_length_after_meta(modbus_t *ctx, uint8_t *msg,
    - read() or recv() error codes
 */
 
-static int receive_msg(modbus_t *ctx, uint8_t *msg, msg_type_t msg_type)
+static int receive_one_msg(modbus_t *ctx, uint8_t *msg, msg_type_t msg_type, struct timeval* tv)
 {
     int rc;
     fd_set rfds;
-    struct timeval tv;
+    struct timeval byte_tv;
     struct timeval *p_tv;
     int length_to_read;
     int msg_length = 0;
@@ -361,9 +362,7 @@ static int receive_msg(modbus_t *ctx, uint8_t *msg, msg_type_t msg_type)
          * received */
         p_tv = NULL;
     } else {
-        tv.tv_sec = ctx->response_timeout.tv_sec;
-        tv.tv_usec = ctx->response_timeout.tv_usec;
-        p_tv = &tv;
+        p_tv = tv;
     }
 
     while (length_to_read != 0) {
@@ -446,16 +445,49 @@ static int receive_msg(modbus_t *ctx, uint8_t *msg, msg_type_t msg_type)
             /* If there is no character in the buffer, the allowed timeout
                interval between two consecutive bytes is defined by
                byte_timeout */
-            tv.tv_sec = ctx->byte_timeout.tv_sec;
-            tv.tv_usec = ctx->byte_timeout.tv_usec;
-            p_tv = &tv;
+            
+            modbus_get_byte_timeout(ctx, &byte_tv);
+            p_tv = &byte_tv;
         }
     }
 
     if (ctx->debug)
         printf("\n");
 
-    return ctx->backend->check_integrity(ctx, msg, msg_length);
+    // copy timeout data to caller
+    if(tv && p_tv) *tv = *p_tv;
+
+    rc = ctx->backend->check_integrity(ctx, msg, msg_length);
+    return rc;
+}
+
+static int receive_msg(modbus_t *ctx, uint8_t *msg, msg_type_t msg_type)
+{
+    
+    struct timeval tv;
+    modbus_get_response_timeout(ctx, &tv);
+    return receive_one_msg(ctx, msg, msg_type, &tv);
+}
+
+/* Waits for response_timeout for a given slave to respond
+*/
+static int receive_msg_slave(modbus_t *ctx, uint8_t *msg, msg_type_t msg_type, int slave) {
+    int rc;
+    struct timeval tv;
+    modbus_get_response_timeout(ctx, &tv);
+
+    do {
+        rc = receive_one_msg(ctx, msg, msg_type, &tv);
+    // while the messages we get are valid 
+    //    and the messages we get are from the wrong slave (if slave is -1, dont ever loop)
+    //       and our response timeout hasnt got to 0 (setting a byte timeout breaks this check)
+    //          keep looping
+    } while(rc != -1 && \
+           (slave != -1) && \
+           (msg[0] != slave) && \
+           (tv.tv_usec > 0 || tv.tv_sec > 0));
+    
+    return rc;
 }
 
 /* Receive the request from a modbus master */
@@ -1069,7 +1101,7 @@ static int read_registers(modbus_t *ctx, int function, int addr, int nb,
         int offset;
         int i;
 
-        rc = receive_msg(ctx, rsp, MSG_CONFIRMATION);
+        rc = receive_msg_slave(ctx, rsp, MSG_CONFIRMATION, ctx->slave);
         if (rc == -1)
             return -1;
 
